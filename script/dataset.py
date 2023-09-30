@@ -1,5 +1,5 @@
 import logging
-from functools import cmp_to_key, reduce
+from functools import cmp_to_key, partial, reduce
 from pathlib import Path
 
 import numpy as np
@@ -34,8 +34,9 @@ class MIDIDataset(Dataset):
     ):
         from multiprocessing import cpu_count
 
-        meta = pd.read_csv(dataset_dir / "metadata.csv")
-        dataset = prepare_features(dataset_dir, feature_pickle, cpu_count())
+        meta = pd.read_csv(dataset_dir / "metadata.csv")  # type: ignore
+        n_process = min(cpu_count(), 32)
+        dataset = prepare_features(dataset_dir, feature_pickle, n_process)
         assert len(meta) == len(dataset)
 
         selection = np.nonzero(meta["split"] == split)[0]
@@ -50,16 +51,18 @@ class MIDIDataset(Dataset):
         else:
             self.annots = annot_kinds
         self.augments = nn.Sequential(
-            RandomPitchShift(),
-            RandomTempoChange(),
-            RandomAddRemoveNotes(),
+            # RandomPitchShift(),
+            # RandomTempoChange(),
+            # RandomAddRemoveNotes(),
         )
 
     def __len__(self):
         return len(self.metadata)
 
     def __getitem__(self, index) -> tuple[Tensor, list[Tensor]]:
-        notes, annots = self.augments(self.dataset[index])
+        notes, annots = self.dataset[index]
+        assert notes.dtype == torch.float32
+        notes, annots = self.augments(notes, annots)
         annots = [annots[k] for k in self.annots]
         return notes, annots
 
@@ -77,35 +80,34 @@ def prepare_features(dataset_dir: Path, pickle_file: Path, workers: int):
         # Missing values are loaded as NaN, and we'll convert them to None
         meta = pd.read_csv(dataset_dir / "metadata.csv").replace({np.nan: None})
         rows = [row for _, row in meta.iterrows()]
+        worker_f = partial(_prepare_one_feature, prefix=dataset_dir)
         if workers > 0:
-            ret = process_map(
-                _prepare_one_feature, rows, max_workers=workers, chunksize=16
-            )
+            ret = process_map(worker_f, rows, max_workers=workers, chunksize=4)
         else:
-            ret = [_prepare_one_feature(row) for row in tqdm(rows)]
+            ret = [worker_f(row) for row in tqdm(rows)]
         torch.save(ret, pickle_file)
     return ret
 
 
-def _prepare_one_feature(row):
+def _prepare_one_feature(row, prefix: Path):
     if row["annot_file"] is None:
         # get note sequence and annots dict
         # (beats, downbeats, key signatures, time signatures, musical onset times, note value in beats, hand parts)
-        notes, annots = read_midi_notes_and_annots(row["perf_midi_file"])
+        notes, annots = read_midi_notes_and_annots(prefix / row["perf_midi_file"])
     else:
         # get note sequence
-        notes = read_midi_notes(row["perf_midi_file"])
+        notes = read_midi_notes(prefix / row["perf_midi_file"])
         # get annots dict (beats, downbeats, key signatures, time signatures)
-        annots = read_annot_file(row["annot_file"])
+        annots = read_annot_file(prefix / row["annot_file"])
     return notes, annots
 
 
-def read_midi_notes(midi_file):
+def read_midi_notes(midi_file: Path):
     """
     Get note sequence from midi file.
     Note sequence is in a list of (pitch, onset, duration, velocity) tuples, in np.array.
     """
-    midi_data = pm.PrettyMIDI(str(Path(midi_file)))
+    midi_data = pm.PrettyMIDI(midi_file.as_posix())
     notes = reduce(lambda x, y: x + y, [inst.notes for inst in midi_data.instruments])
     notes = sorted(notes, key=cmp_to_key(compare_note_order))
     # conver to numpy array
@@ -118,7 +120,7 @@ def read_midi_notes(midi_file):
     return notes
 
 
-def read_annot_file(annot_file):
+def read_annot_file(annot_file: Path):
     """
     Get annots from annotation file in ASAP dataset.
     annotatioins in a dict of {
@@ -128,13 +130,16 @@ def read_annot_file(annot_file):
         key_signatures: list of (time, key_number) tuples
     }, all in torch.tensor.
     """
-    annot_data = pd.read_csv(str(Path(annot_file)), header=None, sep="\t")
+    annot_data = pd.read_csv(annot_file.as_posix(), header=None, sep="\t")
 
-    nsharp_to_note = {
-        num: KEYSIG_N_SHARPS[key_sig] for num, key_sig in enumerate(KEYSIG_NOTE)
+    name_to_pitch = {
+        name: idx for idx, name in enumerate(KEYSIG_NOTE)
+    }
+    nsharp_to_pitch = {
+        n_sharps: name_to_pitch[name] for name, n_sharps in KEYSIG_N_SHARPS.items()
     }
     beats, downbeats, key_signatures, time_signatures = [], [], [], []
-    for i, row in annot_data.iterrows():
+    for _, row in annot_data.iterrows():
         a = row[2].split(",")
         # beats
         beats.append(row[0])
@@ -147,14 +152,14 @@ def read_annot_file(annot_file):
             time_signatures.append((row[0], int(numerator), int(denominator)))
         # key_signatures
         if len(a) == 3 and a[2] != "":
-            key_signatures.append((row[0], nsharp_to_note[int(a[2])]))
+            key_signatures.append((row[0], nsharp_to_pitch[int(a[2])]))
 
     # save as annotation dict
     annots = {
-        "beats": torch.tensor(beats),
-        "downbeats": torch.tensor(downbeats),
-        "time_signatures": torch.tensor(time_signatures),
-        "key_signatures": torch.tensor(key_signatures),
+        "beats": torch.tensor(beats).float(),
+        "downbeats": torch.tensor(downbeats).float(),
+        "time_signatures": torch.tensor(time_signatures).float(),
+        "key_signatures": torch.tensor(key_signatures).float(),
         "onsets_musical": torch.zeros(0),
         "note_value": torch.zeros(0),
         # Shape matches the output of read_midi_notes_and_annots
@@ -163,7 +168,7 @@ def read_annot_file(annot_file):
     return annots
 
 
-def read_midi_notes_and_annots(midi_file):
+def read_midi_notes_and_annots(midi_file: Path):
     """
     Get beat sequence and annots from midi file.
     Note sequence is in a list of (pitch, onset, duration, velocity) tuples, in np.array.
@@ -176,7 +181,7 @@ def read_midi_notes_and_annots(midi_file):
         note_value: list of note values (in beats),
         hands: list of hand part for each note (0: left, 1: right)
     """
-    midi_data = pm.PrettyMIDI(str(Path(midi_file)))
+    midi_data = pm.PrettyMIDI(midi_file.as_posix())
 
     # note sequence and hands
     if len(midi_data.instruments) == 2:
@@ -245,13 +250,15 @@ def read_midi_notes_and_annots(midi_file):
     )
     # save as annotation dict
     annots = {
-        "beats": torch.tensor(beats),
-        "downbeats": torch.tensor(downbeats),
-        "time_signatures": torch.tensor(time_signatures),
-        "key_signatures": torch.tensor(key_signatures),
-        "onsets_musical": torch.tensor(onsets_musical),
-        "note_value": torch.tensor(note_values),
-        "hands": torch.tensor(hands) if hands is not None else torch.zeros(0, 2),
+        "beats": torch.tensor(beats).float(),
+        "downbeats": torch.tensor(downbeats).float(),
+        "time_signatures": torch.tensor(time_signatures).float(),
+        "key_signatures": torch.tensor(key_signatures).float(),
+        "onsets_musical": torch.tensor(onsets_musical).float(),
+        "note_value": torch.tensor(note_values).float(),
+        "hands": torch.tensor(hands).float()
+        if hands is not None
+        else torch.zeros(0, 2),
     }
     return notes, annots
 
