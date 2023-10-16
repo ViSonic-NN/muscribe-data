@@ -1,5 +1,5 @@
 import logging
-from functools import cmp_to_key, partial, reduce
+from functools import cmp_to_key, partial
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +10,7 @@ from torch import Tensor, nn
 from torch.utils.data import Dataset
 
 from .augment import RandomAddRemoveNotes, RandomPitchShift, RandomTempoChange
-from .consts import BEAT_EPS, KEYSIG_N_SHARPS, KEYSIG_NOTE
+from .consts import MIDI_IDX_TO_NATURAL_IDX
 
 logger = logging.getLogger(__name__)
 ANNOT_KEYS = [
@@ -22,6 +22,7 @@ ANNOT_KEYS = [
     "note_value",
     "hands",
 ]
+NO_ASAP_KEYS = set(["onsets_musical", "note_value", "hands"])
 
 
 class MIDIDataset(Dataset):
@@ -39,10 +40,6 @@ class MIDIDataset(Dataset):
         dataset = prepare_features(dataset_dir, feature_pickle, n_process)
         assert len(meta) == len(dataset)
 
-        selection = np.nonzero(meta["split"] == split)[0]
-        self.metadata = meta.iloc[selection].reset_index()
-        # int() is only for type checking
-        self.dataset = [dataset[int(i)] for i in selection]
         self.split = split
         if annot_kinds is None:
             self.annots = ANNOT_KEYS  # Request all features
@@ -50,6 +47,16 @@ class MIDIDataset(Dataset):
             self.annots = [annot_kinds]
         else:
             self.annots = annot_kinds
+        selection = meta["split"] == split
+        if NO_ASAP_KEYS.intersection(self.annots):
+            logger.warning(
+                "Requesting annotations that are not available in ASAP dataset; skipping ASAP dataset."
+            )
+            selection &= meta["source"] != "ASAP"
+        selection = np.nonzero(selection)[0]
+        self.metadata = meta.iloc[selection].reset_index()
+        # int() is only for type checking
+        self.dataset = [dataset[int(i)] for i in selection]
         self.augments = nn.Sequential(
             # RandomPitchShift(),
             # RandomTempoChange(),
@@ -60,9 +67,7 @@ class MIDIDataset(Dataset):
         return len(self.metadata)
 
     def __getitem__(self, index) -> tuple[Tensor, list[Tensor]]:
-        notes, annots = self.dataset[index]
-        assert notes.dtype == torch.float32
-        notes, annots = self.augments(notes, annots)
+        notes, annots = self.augments(self.dataset[index])
         annots = [annots[k] for k in self.annots]
         return notes, annots
 
@@ -105,25 +110,22 @@ def _prepare_one_feature(row, prefix: Path):
 def read_midi_notes(midi_file: Path):
     """
     Get note sequence from midi file.
-    Note sequence is in a list of (pitch, onset, duration, velocity) tuples, in np.array.
+    Note sequence is in a list of (pitch, onset, duration, velocity) tuples, in torch.array.
     """
     midi_data = pm.PrettyMIDI(midi_file.as_posix())
-    notes = reduce(lambda x, y: x + y, [inst.notes for inst in midi_data.instruments])
+    notes = [note for inst in midi_data.instruments for note in inst.notes]
     notes = sorted(notes, key=cmp_to_key(compare_note_order))
     # conver to numpy array
-    notes = torch.tensor(
-        [
-            (note.pitch, note.start, note.end - note.start, note.velocity)
-            for note in notes
-        ]
-    )
-    return notes
+    notes = [
+        (note.pitch, note.start, note.end - note.start, note.velocity) for note in notes
+    ]
+    return torch.tensor(notes).float()
 
 
 def read_annot_file(annot_file: Path):
     """
     Get annots from annotation file in ASAP dataset.
-    annotatioins in a dict of {
+    annotations in a dict of {
         beats: list of beat times,
         downbeats: list of downbeat times,
         time_signatures: list of (time, numerator, denominator) tuples,
@@ -131,41 +133,27 @@ def read_annot_file(annot_file: Path):
     }, all in torch.tensor.
     """
     annot_data = pd.read_csv(annot_file.as_posix(), header=None, sep="\t")
-
-    name_to_pitch = {
-        name: idx for idx, name in enumerate(KEYSIG_NOTE)
-    }
-    nsharp_to_pitch = {
-        n_sharps: name_to_pitch[name] for name, n_sharps in KEYSIG_N_SHARPS.items()
-    }
-    beats, downbeats, key_signatures, time_signatures = [], [], [], []
-    for _, row in annot_data.iterrows():
-        a = row[2].split(",")
-        # beats
-        beats.append(row[0])
+    beats = annot_data[0].to_numpy()
+    downbeats, key_sigs, time_sigs = [], [], []
+    for onset, annot_str in annot_data[[0, 2]].to_numpy():
+        annots = annot_str.split(",")
         # downbeats
-        if a[0] == "db":
-            downbeats.append(row[0])
+        if annots[0] == "db":
+            downbeats.append(onset)
         # time_signatures
-        if len(a) >= 2 and a[1] != "":
-            numerator, denominator = a[1].split("/")
-            time_signatures.append((row[0], int(numerator), int(denominator)))
+        if len(annots) >= 2 and annots[1] != "":
+            numer, denom = annots[1].split("/")
+            time_sigs.append((onset, int(numer), int(denom)))
         # key_signatures
-        if len(a) == 3 and a[2] != "":
-            key_signatures.append((row[0], nsharp_to_pitch[int(a[2])]))
-
-    # save as annotation dict
-    annots = {
-        "beats": torch.tensor(beats).float(),
+        if len(annots) == 3 and annots[2] != "":
+            key_sigs.append((onset, MIDI_IDX_TO_NATURAL_IDX[int(annots[2])]))
+    return {
+        "beats": torch.from_numpy(beats).float(),
         "downbeats": torch.tensor(downbeats).float(),
-        "time_signatures": torch.tensor(time_signatures).float(),
-        "key_signatures": torch.tensor(key_signatures).float(),
-        "onsets_musical": torch.zeros(0),
-        "note_value": torch.zeros(0),
-        # Shape matches the output of read_midi_notes_and_annots
-        "hands": torch.zeros(0, 2),
+        "time_signatures": torch.tensor(time_sigs).float(),
+        "key_signatures": torch.tensor(key_sigs).float(),
+        # "onsets_musical", "note_value", "hands" are not available in ASAP dataset
     }
-    return annots
 
 
 def read_midi_notes_and_annots(midi_file: Path):
@@ -186,34 +174,28 @@ def read_midi_notes_and_annots(midi_file: Path):
     # note sequence and hands
     if len(midi_data.instruments) == 2:
         # two hand parts
-        note_sequence_with_hand = []
-        for hand, inst in enumerate(midi_data.instruments):
-            for note in inst.notes:
-                note_sequence_with_hand.append((note, hand))
-
-        def compare_note_with_hand(x, y):
-            return compare_note_order(x[0], y[0])
-
-        note_sequence_with_hand = sorted(
-            note_sequence_with_hand, key=cmp_to_key(compare_note_with_hand)
+        notes_hands = [
+            (note, hand)
+            for hand, inst in enumerate(midi_data.instruments)
+            for note in inst.notes
+        ]
+        notes_hands = sorted(
+            notes_hands, key=cmp_to_key(lambda x, y: compare_note_order(x[0], y[0]))
         )
-
-        notes, hands = [], []
-        for note, hand in note_sequence_with_hand:
-            notes.append(note)
-            hands.append(hand)
+        notes, hands = zip(*notes_hands)
     else:
         # ignore data with other numbers of hand parts
-        notes = reduce(
-            lambda x, y: x + y, [inst.notes for inst in midi_data.instruments]
-        )
+        notes = [note for inst in midi_data.instruments for note in inst.notes]
         notes = sorted(notes, key=cmp_to_key(compare_note_order))
         hands = None
+    notes = [
+        [note.pitch, note.start, note.end - note.start, note.velocity] for note in notes
+    ]
+    notes = torch.tensor(notes).float()
 
-    # beats
-    beats = midi_data.get_beats()
-    # downbeats
-    downbeats = midi_data.get_downbeats()
+    # beats, downbeats
+    beats = torch.from_numpy(midi_data.get_beats()).float()
+    downbeats = torch.from_numpy(midi_data.get_downbeats()).float()
     # time_signatures
     time_signatures = [
         (t.time, t.numerator, t.denominator) for t in midi_data.time_signature_changes
@@ -221,46 +203,30 @@ def read_midi_notes_and_annots(midi_file: Path):
     # key_signatures
     key_signatures = [(k.time, k.key_number) for k in midi_data.key_signature_changes]
 
-    # onsets_musical and note_values
-    TT = midi_data.time_to_tick
+    note_onsets = notes[:, 1]
+    note_beat = torch.searchsorted(beats, note_onsets, right=True)
+    # If a note lands before the first beat, we assign it to beats[0] and beats[1];
+    note_beat[note_beat == 0] = 1
+    # if after the last beat, we assign it to beats[-2] and beats[-1].
+    note_beat[note_beat == len(beats)] = -1
 
-    def times2note_value(start, end):
-        # convert start and end times to note value (unit: beat, range: 0-4)
-        this = np.where(beats - start <= BEAT_EPS)[0][-1]
-        this, next = (this, this + 1) if this + 1 < len(beats) else (-2, -1)
-        return (TT(end) - TT(start)) / (TT(beats[next]) - TT(beats[this]))
+    ttt = midi_data.time_to_tick
+    note_onset_ticks = torch.tensor([ttt(note) for note in note_onsets])
+    note_end_ticks = torch.tensor([ttt(onset + dur) for _, onset, dur, _ in notes])
+    beat_ticks = torch.tensor([ttt(beat) for beat in beats])
+    beat_tick_diff = beat_ticks[note_beat] - beat_ticks[note_beat - 1]
 
-    time2pos = lambda t: times2note_value(
-        t, t
-    )  # convert time to position in musical time within a beat (unit: beat, range: 0-1)
-
-    # get onsets_musical and note_values
-    # filter out small negative values (they are usually caused by errors in time_to_tick convertion)
-    onsets_musical = [
-        min(1, max(0, time2pos(note.start))) for note in notes
-    ]  # in range 0-1
-    note_values = [max(0, times2note_value(note.start, note.end)) for note in notes]
-
-    # conver to Tensor
-    notes = torch.tensor(
-        [
-            [note.pitch, note.start, note.end - note.start, note.velocity]
-            for note in notes
-        ]
-    )
-    # save as annotation dict
-    annots = {
-        "beats": torch.tensor(beats).float(),
-        "downbeats": torch.tensor(downbeats).float(),
+    return notes, {
+        "beats": beats,
+        "downbeats": downbeats,
         "time_signatures": torch.tensor(time_signatures).float(),
         "key_signatures": torch.tensor(key_signatures).float(),
-        "onsets_musical": torch.tensor(onsets_musical).float(),
-        "note_value": torch.tensor(note_values).float(),
+        "onsets_musical": note_onset_ticks / beat_tick_diff,
+        "note_value": (note_end_ticks - note_onset_ticks) / beat_tick_diff,
         "hands": torch.tensor(hands).float()
         if hands is not None
         else torch.zeros(0, 2),
     }
-    return notes, annots
 
 
 def compare_note_order(note1, note2):

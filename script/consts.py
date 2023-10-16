@@ -1,12 +1,26 @@
+# =========== key signature definitions ==========
+# key in sharps in MIDI
 # fmt: off
-KEYSIG_N_SHARPS = {
-    "C": 0, "G": 1, "D": 2, "A": 3, "E": 4, "B": 5, "F#": 6, "C#m": 7, "G#m": 8, "D#m": 9, "Bbm": 10, "Fm": 11, "Cm": 12,
-    "Gm": -11, "Dm": -10, "Am": -9, "Em": -8, "Bm": -7, "F#m": -6, "Db": -5, "Ab": -4, "Eb": -3, "Bb": -2, "F": -1,
+MIDI_KEY_ORDER = {
+    0: "C", 1: "G", 2: "D", 3: "A", 4: "E", 5: "B", 6: "F#", 7: "C#m", 8: "G#m", 9: "D#m", 10: "Bbm", 11: "Fm", 12: "Cm",
+    -11: "Gm", -10: "Dm", -9: "Am", -8: "Em", -7: "Bm", -6: "F#m", -5: "Db", -4: "Ab", -3: "Eb", -2: "Bb", -1: "F",
 }
-KEYSIG_NOTE = [
+NATURAL_KEY_ORDER = [
     "C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B",
     "Cm", "C#m", "Dm", "D#m", "Em", "Fm", "F#m", "Gm", "G#m", "Am", "Bbm", "Bm",
 ]
+# NAME_TO_NSHARPS is almost the inverse of MIDI_KEY_TO_KEY_NAME ... except that it does not distinguish major and minor keys
+NAME_TO_NSHARPS = {
+    "C": 0, "Db": -5, "D": 2, "Eb": -3, "E": 4, "F": -1, "F#": 6, "G": 1, "Ab": -4, "A": 3, "Bb": -2, "B": 5,
+    "Cm": -3, "C#m": 4, "Dm": 1, "D#m": 6, "Em": 3, "Fm": -2, "F#m": 5, "Gm": 2, "G#m": -3, "Am": 4, "Bbm": 1, "Bm": 6,
+}
 # fmt: on
+_key_to_natural_idx = {
+    name: idx for idx, name in enumerate(NATURAL_KEY_ORDER)
+}
+MIDI_IDX_TO_NATURAL_IDX = {
+    midx: _key_to_natural_idx[name] for midx, name in MIDI_KEY_ORDER.items()
+}
 
-BEAT_EPS = 0.05  # tolerance for beat alignment: 0.05s = 50ms
+# =========== beat detection definitions ==========
+BEAT_EPS = 0.02  # tolerance for beat alignment: 0.02s = 20ms
