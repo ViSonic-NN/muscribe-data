@@ -1,3 +1,3 @@
-from .augment import RandomAddRemoveNotes, RandomPitchShift, RandomTempoChange
+from . import dataset
 from .consts import *
-from .dataset import MIDIDataset, read_midi_notes
+from .dataset import read_midi_notes

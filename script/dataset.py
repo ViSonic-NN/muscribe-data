@@ -1,18 +1,15 @@
 import logging
 from functools import cmp_to_key, partial
+from multiprocessing import cpu_count
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pretty_midi as pm
 import torch
-from torch import Tensor, nn
-from torch.utils.data import Dataset
 
-from .augment import RandomAddRemoveNotes, RandomPitchShift, RandomTempoChange
 from .consts import MIDI_IDX_TO_NATURAL_IDX
 
-logger = logging.getLogger(__name__)
 ANNOT_KEYS = [
     "beats",
     "downbeats",
@@ -24,74 +21,32 @@ ANNOT_KEYS = [
 ]
 NO_ASAP_KEYS = set(["onsets_musical", "note_value", "hands"])
 
-
-class MIDIDataset(Dataset):
-    def __init__(
-        self,
-        dataset_dir: Path,
-        feature_pickle: Path,
-        split: str | list[str],
-        annot_kinds: str | list[str] | None = None,
-    ):
-        from multiprocessing import cpu_count
-
-        meta = pd.read_csv(dataset_dir / "metadata.csv")  # type: ignore
-        n_process = min(cpu_count(), 32)
-        dataset = prepare_features(dataset_dir, feature_pickle, n_process)
-        assert len(meta) == len(dataset)
-
-        self.split = split
-        if annot_kinds is None:
-            self.annots = ANNOT_KEYS  # Request all features
-        elif isinstance(annot_kinds, str):
-            self.annots = [annot_kinds]
-        else:
-            self.annots = annot_kinds
-        selection = meta["split"] == split
-        if NO_ASAP_KEYS.intersection(self.annots):
-            logger.warning(
-                "Requesting annotations that are not available in ASAP dataset; skipping ASAP dataset."
-            )
-            selection &= meta["source"] != "ASAP"
-        selection = np.nonzero(selection)[0]
-        self.metadata = meta.iloc[selection].reset_index()
-        # int() is only for type checking
-        self.dataset = [dataset[int(i)] for i in selection]
-        self.augments = nn.Sequential(
-            # RandomPitchShift(),
-            # RandomTempoChange(),
-            # RandomAddRemoveNotes(),
-        )
-
-    def __len__(self):
-        return len(self.metadata)
-
-    def __getitem__(self, index) -> tuple[Tensor, list[Tensor]]:
-        notes, annots = self.augments(self.dataset[index])
-        annots = [annots[k] for k in self.annots]
-        return notes, annots
+logger = logging.getLogger(__name__)
+_n_processes = min(32, cpu_count())
 
 
-def prepare_features(dataset_dir: Path, pickle_file: Path, workers: int):
+def read_full_dataset(
+    dataset_dir: Path, pickle_file: Path, workers: int = _n_processes
+):
     from tqdm import tqdm
     from tqdm.contrib.concurrent import process_map
 
+    # Missing values are loaded as NaN, and we'll convert them to None
+    meta = pd.read_csv(dataset_dir / "metadata.csv").replace({np.nan: None})
     if pickle_file.exists():
-        ret = torch.load(pickle_file)
-        assert isinstance(ret, list)
-        assert all(isinstance(x, tuple) and len(x) == 2 for x in ret)
+        data = torch.load(pickle_file)
+        assert isinstance(data, list)
+        assert all(isinstance(x, tuple) and len(x) == 2 for x in data)
     else:
         logger.info("Preparing features...")
-        # Missing values are loaded as NaN, and we'll convert them to None
-        meta = pd.read_csv(dataset_dir / "metadata.csv").replace({np.nan: None})
         rows = [row for _, row in meta.iterrows()]
         worker_f = partial(_prepare_one_feature, prefix=dataset_dir)
         if workers > 0:
-            ret = process_map(worker_f, rows, max_workers=workers, chunksize=4)
+            data = process_map(worker_f, rows, max_workers=workers, chunksize=4)
         else:
-            ret = [worker_f(row) for row in tqdm(rows)]
-        torch.save(ret, pickle_file)
-    return ret
+            data = [worker_f(row) for row in tqdm(rows)]
+        torch.save(data, pickle_file)
+    return meta, data
 
 
 def _prepare_one_feature(row, prefix: Path):
@@ -107,12 +62,12 @@ def _prepare_one_feature(row, prefix: Path):
     return notes, annots
 
 
-def read_midi_notes(midi_file: Path):
+def read_midi_notes(midi_file: Path | str):
     """
     Get note sequence from midi file.
     Note sequence is in a list of (pitch, onset, duration, velocity) tuples, in torch.array.
     """
-    midi_data = pm.PrettyMIDI(midi_file.as_posix())
+    midi_data = pm.PrettyMIDI(str(midi_file))
     notes = [note for inst in midi_data.instruments for note in inst.notes]
     notes = sorted(notes, key=cmp_to_key(compare_note_order))
     # conver to numpy array

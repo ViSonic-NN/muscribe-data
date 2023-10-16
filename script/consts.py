@@ -15,12 +15,7 @@ NAME_TO_NSHARPS = {
     "Cm": -3, "C#m": 4, "Dm": 1, "D#m": 6, "Em": 3, "Fm": -2, "F#m": 5, "Gm": 2, "G#m": -3, "Am": 4, "Bbm": 1, "Bm": 6,
 }
 # fmt: on
-_key_to_natural_idx = {
-    name: idx for idx, name in enumerate(NATURAL_KEY_ORDER)
-}
+_key_to_natural_idx = {name: idx for idx, name in enumerate(NATURAL_KEY_ORDER)}
 MIDI_IDX_TO_NATURAL_IDX = {
     midx: _key_to_natural_idx[name] for midx, name in MIDI_KEY_ORDER.items()
 }
-
-# =========== beat detection definitions ==========
-BEAT_EPS = 0.02  # tolerance for beat alignment: 0.02s = 20ms
