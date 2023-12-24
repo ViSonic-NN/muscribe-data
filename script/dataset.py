@@ -62,17 +62,18 @@ def _prepare_one_feature(row, prefix: Path):
     return notes, annots
 
 
-def read_midi_notes(midi_file: Path | str):
+def read_midi_notes(midi_file: Path | str, offset: float = 0.0, duration: float | None = None):
     """
     Get note sequence from midi file.
     Note sequence is in a list of (pitch, onset, duration, velocity) tuples, in torch.array.
     """
     midi_data = pm.PrettyMIDI(str(midi_file))
     notes = [note for inst in midi_data.instruments for note in inst.notes]
-    notes = sorted(notes, key=cmp_to_key(compare_note_order))
-    # conver to numpy array
+    notes = sorted(notes, key=_note_sort_key)
+    duration = duration or float("inf")
     notes = [
-        (note.pitch, note.start, note.end - note.start, note.velocity) for note in notes
+        (note.pitch, start, end - start, note.velocity) for note in notes
+        if (start := note.start - offset) >= 0 and (end := note.end - offset) < duration
     ]
     return torch.tensor(notes).float()
 
@@ -135,13 +136,13 @@ def read_midi_notes_and_annots(midi_file: Path):
             for note in inst.notes
         ]
         notes_hands = sorted(
-            notes_hands, key=cmp_to_key(lambda x, y: compare_note_order(x[0], y[0]))
+            notes_hands, key=lambda pair: _note_sort_key(pair[0])
         )
         notes, hands = zip(*notes_hands)
     else:
         # ignore data with other numbers of hand parts
         notes = [note for inst in midi_data.instruments for note in inst.notes]
-        notes = sorted(notes, key=cmp_to_key(compare_note_order))
+        notes = sorted(notes, key=_note_sort_key)
         hands = None
     notes = [
         [note.pitch, note.start, note.end - note.start, note.velocity] for note in notes
@@ -184,18 +185,5 @@ def read_midi_notes_and_annots(midi_file: Path):
     }
 
 
-def compare_note_order(note1, note2):
-    """
-    Compare two notes by firstly onset and then pitch.
-    """
-    if note1.start < note2.start:
-        return -1
-    elif note1.start == note2.start:
-        if note1.pitch < note2.pitch:
-            return -1
-        elif note1.pitch == note2.pitch:
-            return 0
-        else:
-            return 1
-    else:
-        return 1
+def _note_sort_key(note):
+    return note.start, note.pitch
