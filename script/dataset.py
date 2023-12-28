@@ -1,5 +1,5 @@
 import logging
-from functools import cmp_to_key, partial
+from functools import partial
 from multiprocessing import cpu_count
 from pathlib import Path
 
@@ -7,8 +7,6 @@ import numpy as np
 import pandas as pd
 import pretty_midi as pm
 import torch
-
-from .consts import MIDI_IDX_TO_NATURAL_IDX
 
 ANNOT_KEYS = [
     "beats",
@@ -102,7 +100,7 @@ def read_annot_file(annot_file: Path):
             time_sigs.append((onset, int(numer), int(denom)))
         # key_signatures
         if len(annots) == 3 and annots[2] != "":
-            key_sigs.append((onset, MIDI_IDX_TO_NATURAL_IDX[int(annots[2])]))
+            key_sigs.append((onset, int(annots[2])))
     return {
         "beats": torch.from_numpy(beats).float(),
         "downbeats": torch.tensor(downbeats).float(),
@@ -159,7 +157,7 @@ def read_midi_notes_and_annots(midi_file: Path):
     # key_signatures
     key_signatures = [(k.time, k.key_number) for k in midi_data.key_signature_changes]
 
-    note_onsets = notes[:, 1]
+    note_onsets = notes[:, 1].contiguous()
     note_beat = torch.searchsorted(beats, note_onsets, right=True)
     # If a note lands before the first beat, we assign it to beats[0] and beats[1];
     note_beat[note_beat == 0] = 1
